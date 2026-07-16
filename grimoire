@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""grimoire — a small vertical retro-mac terminal widget for cataloguing
+aesthetics/moods/motifs and pulling a random seed set to build a concept from.
+stdlib only (curses) — deliberately not run via `uv run --script`.
+"""
+
+import curses
+import json
+import random
+import re
+import textwrap
+from collections import Counter
+from datetime import date, datetime
+from pathlib import Path
+
+DB_PATH = Path.home() / ".local/share/grimoire/db.json"
+BUILDS_DIR = Path(__file__).resolve().parent / "builds"
+
+HELP_TEXT = [
+    "commands:",
+    "  add <category> <text> [#tag ...]   file a new entry",
+    "  list [category|#tag]  (ls)         show entries, optionally filtered",
+    "  tag <id> #tag [#tag ...]           add tags to an entry",
+    "  rm <id>  (del)                     remove an entry",
+    "  roll [n] [category|#tag]           randomly pull n entries (default 3)",
+    "  build [name]                       save the last roll as a build sheet",
+    "  categories  (cat)                  list categories + counts",
+    "  find <term>                        search text/tags/category",
+    "  clear                              drop the active filter",
+    "  help                               this",
+    "  quit  (:q, exit)                   leave",
+    "",
+    "examples:",
+    "  add palette black voidscape, red neon veins #hackercore #ritual",
+    "  add mood restless midnight circuitry #glitch",
+    "  roll 3 #hackercore",
+    "  build my-next-thing",
+]
+
+QUIT = object()
+
+
+class App:
+    def __init__(self):
+        self.entries, self.next_id = self._load()
+        self.last_roll = []
+
+    def _load(self):
+        if not DB_PATH.exists():
+            return [], 1
+        try:
+            data = json.loads(DB_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            return [], 1
+        entries = data.get("entries", [])
+        next_id = data.get("next_id", (max((e["id"] for e in entries), default=0) + 1))
+        return entries, next_id
+
+    def _save(self):
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        DB_PATH.write_text(json.dumps({"entries": self.entries, "next_id": self.next_id}, indent=2))
+
+    def _filter(self, filt):
+        filt = (filt or "").strip()
+        if not filt:
+            return list(self.entries)
+        if filt.startswith("#"):
+            tag = filt[1:].lower()
+            return [e for e in self.entries if tag in e["tags"]]
+        cat = filt.lower()
+        return [e for e in self.entries if cat in e["category"].lower()]
+
+    def dispatch(self, raw):
+        cmd, _, rest = raw.strip().partition(" ")
+        cmd = cmd.lower()
+        rest = rest.strip()
+
+        if cmd in ("quit", "exit", ":q"):
+            return QUIT
+        if cmd in ("", "help", "?"):
+            return list(HELP_TEXT), "commands: add, list, tag, rm, roll, build, categories, find, clear, help, quit"
+        if cmd == "add":
+            return self._cmd_add(rest)
+        if cmd in ("list", "ls"):
+            return self._cmd_list(rest)
+        if cmd == "tag":
+            return self._cmd_tag(rest)
+        if cmd in ("rm", "del"):
+            return self._cmd_rm(rest)
+        if cmd == "roll":
+            return self._cmd_roll(rest)
+        if cmd == "build":
+            return self._cmd_build(rest)
+        if cmd in ("categories", "cat"):
+            return self._cmd_categories(rest)
+        if cmd == "find":
+            return self._cmd_find(rest)
+        if cmd == "clear":
+            return self.render_list_view(list(self.entries)), "filter cleared"
+        return [f"unknown command: '{cmd}'", "try 'help' for the command list"], f"unknown command '{cmd}'"
+
+    def _cmd_add(self, rest):
+        parts = rest.split(None, 1)
+        if len(parts) < 2:
+            return ["usage: add <category> <text> [#tag ...]"], "error: missing category or text"
+        category, remainder = parts[0].lower(), parts[1]
+        tags = sorted({t.lower() for t in re.findall(r"#(\S+)", remainder)})
+        text = re.sub(r"#\S+", "", remainder)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return ["entry text is empty"], "error: entry text is empty"
+        eid = self.next_id
+        self.next_id += 1
+        entry = {"id": eid, "category": category, "text": text, "tags": tags, "created": date.today().isoformat()}
+        self.entries.append(entry)
+        self._save()
+        return self.render_list_view(list(self.entries)), f"added [{eid}] {category}"
+
+    def _cmd_list(self, rest):
+        filtered = self._filter(rest)
+        label = f" matching '{rest}'" if rest else ""
+        noun = "entry" if len(filtered) == 1 else "entries"
+        return self.render_list_view(filtered), f"{len(filtered)} {noun}{label}"
+
+    def _cmd_tag(self, rest):
+        parts = rest.split()
+        if len(parts) < 2:
+            return ["usage: tag <id> #tag [#tag ...]"], "error: need an id and at least one tag"
+        try:
+            eid = int(parts[0])
+        except ValueError:
+            return [f"'{parts[0]}' is not a valid id"], "error: bad id"
+        entry = next((e for e in self.entries if e["id"] == eid), None)
+        if entry is None:
+            return [f"no entry [{eid}]"], f"error: no entry [{eid}]"
+        new_tags = sorted({t.lstrip("#").lower() for t in parts[1:]})
+        entry["tags"] = sorted(set(entry["tags"]) | set(new_tags))
+        self._save()
+        return self.render_list_view([entry]), f"tagged [{eid}]: +" + " +".join(new_tags)
+
+    def _cmd_rm(self, rest):
+        try:
+            eid = int(rest.strip())
+        except ValueError:
+            return ["usage: rm <id>"], "error: bad id"
+        before = len(self.entries)
+        self.entries = [e for e in self.entries if e["id"] != eid]
+        if len(self.entries) == before:
+            return [f"no entry [{eid}]"], f"error: no entry [{eid}]"
+        self._save()
+        return self.render_list_view(list(self.entries)), f"removed [{eid}]"
+
+    def _cmd_roll(self, rest):
+        parts = rest.split()
+        n = 3
+        filt = rest
+        if parts and parts[0].isdigit():
+            n = int(parts[0])
+            filt = " ".join(parts[1:])
+        pool = self._filter(filt)
+        if not pool:
+            return ["no entries match — add some first."], "error: nothing to roll"
+        n = min(n, len(pool))
+        self.last_roll = random.sample(pool, n)
+        view = ["THE PULL", ""] + self._entry_lines(self.last_roll)
+        return view, f"rolled {n} — 'build [name]' to save this seed"
+
+    def _cmd_build(self, rest):
+        if not self.last_roll:
+            return ["nothing rolled yet — try 'roll' first."], "error: nothing to build from"
+        name = rest.strip() or datetime.now().strftime("seed-%Y%m%d-%H%M%S")
+        slug = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or "seed"
+        BUILDS_DIR.mkdir(parents=True, exist_ok=True)
+        path = BUILDS_DIR / f"{slug}.txt"
+        i = 2
+        while path.exists():
+            path = BUILDS_DIR / f"{slug}-{i}.txt"
+            i += 1
+        content = self._build_sheet(name, self.last_roll)
+        path.write_text(content)
+        return content.splitlines(), f"saved -> builds/{path.name}"
+
+    def _cmd_categories(self, rest):
+        counts = Counter(e["category"] for e in self.entries)
+        if not counts:
+            return ["(no entries yet)"], "0 categories"
+        lines = [f"{cat}  ({n})" for cat, n in sorted(counts.items(), key=lambda kv: -kv[1])]
+        return lines, f"{len(counts)} categories, {len(self.entries)} entries total"
+
+    def _cmd_find(self, rest):
+        term = rest.strip().lower()
+        if not term:
+            return ["usage: find <term>"], "error: empty search"
+        results = [
+            e for e in self.entries
+            if term in e["text"].lower() or term in e["category"].lower() or any(term in t for t in e["tags"])
+        ]
+        noun = "match" if len(results) == 1 else "matches"
+        return self.render_list_view(results), f"{len(results)} {noun} for '{term}'"
+
+    def _entry_lines(self, entries, width=34):
+        lines = []
+        for e in entries:
+            tagstr = (" {" + " ".join("#" + t for t in e["tags"]) + "}") if e["tags"] else ""
+            body = f"[{e['id']}] {e['category']} — {e['text']}{tagstr}"
+            lines.extend(textwrap.wrap(body, width=width, subsequent_indent="    ") or [""])
+        return lines
+
+    def render_list_view(self, entries, width=34, max_lines=18):
+        if not entries:
+            return ["(nothing here yet)", "try: add mood <text> #tag"]
+        entries = sorted(entries, key=lambda e: -e["id"])
+        lines, shown = [], 0
+        for e in entries:
+            wrapped = self._entry_lines([e], width=width)
+            if len(lines) + len(wrapped) > max_lines - 1 and shown < len(entries):
+                lines.append(f"...and {len(entries) - shown} more (narrow with find/list)")
+                break
+            lines.extend(wrapped)
+            shown += 1
+        return lines
+
+    def render_initial(self):
+        if not self.entries:
+            return ["welcome to grimoire.", "", "file the aesthetics you keep", "coming back to. pull a random", "set later to seed a concept.", "", "try:", "  add mood <text> #tag", "  help"]
+        return self.render_list_view(list(self.entries))
+
+    def _build_sheet(self, name, entries):
+        by_cat = {}
+        for e in entries:
+            by_cat.setdefault(e["category"], []).append(e)
+        out = [f"GRIMOIRE BUILD SHEET — {name}", f"generated {date.today().isoformat()}", ""]
+        for cat, es in sorted(by_cat.items()):
+            out.append(cat.upper())
+            for e in es:
+                tagstr = (" [" + " ".join("#" + t for t in e["tags"]) + "]") if e["tags"] else ""
+                out.append(f"  - {e['text']}{tagstr}")
+            out.append("")
+        out.append("---")
+        out.append("seed for:")
+        out.append("")
+        return "\n".join(out)
+
+
+def safe_addstr(stdscr, y, x, text, attr=0):
+    try:
+        stdscr.addstr(y, x, text, attr)
+    except curses.error:
+        pass
+
+
+def draw_chrome(stdscr, x0, y0, fw, fh, title, pair):
+    inner_w = fw - 2
+    safe_addstr(stdscr, y0, x0, "┌" + "─" * inner_w + "┐", pair)
+    left_box, right_box = "[■]", "[■]"
+    label = f" {title} "
+    stripe_total = max(0, inner_w - len(left_box) - len(right_box) - len(label))
+    left_stripe = "·" * (stripe_total // 2)
+    right_stripe = "·" * (stripe_total - stripe_total // 2)
+    title_line = (left_box + left_stripe + label + right_stripe + right_box)[:inner_w].ljust(inner_w)
+    safe_addstr(stdscr, y0 + 1, x0, "│", pair)
+    safe_addstr(stdscr, y0 + 1, x0 + 1, title_line, pair | curses.A_BOLD)
+    safe_addstr(stdscr, y0 + 1, x0 + fw - 1, "│", pair)
+    safe_addstr(stdscr, y0 + 2, x0, "├" + "─" * inner_w + "┤", pair)
+    for row in range(y0 + 3, y0 + fh - 1):
+        safe_addstr(stdscr, row, x0, "│" + " " * inner_w + "│", pair)
+    safe_addstr(stdscr, y0 + fh - 1, x0, "└" + "─" * inner_w + "┘", pair)
+
+
+def draw_row(stdscr, x0, y, inner_w, text, pair, attr=0):
+    text = (text or "")[:inner_w].ljust(inner_w)
+    safe_addstr(stdscr, y, x0 + 1, text, pair | attr)
+
+
+def main(stdscr):
+    curses.curs_set(1)
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
+    pair = curses.color_pair(1)
+    stdscr.keypad(True)
+
+    term_h, term_w = stdscr.getmaxyx()
+    content_h, inner_w = 18, 34
+    fw, fh = inner_w + 2, content_h + 7
+    while fh > term_h - 1 and content_h > 8:
+        content_h -= 1
+        fh = content_h + 7
+    while fw > term_w - 1 and inner_w > 24:
+        inner_w -= 2
+        fw = inner_w + 2
+    if fh > term_h - 1 or fw > term_w - 1:
+        stdscr.erase()
+        safe_addstr(stdscr, 0, 0, f"terminal too small — need at least {fw + 2} x {fh + 2}")
+        stdscr.refresh()
+        stdscr.getch()
+        return
+
+    x0 = max(0, (term_w - fw) // 2)
+    y0 = max(0, (term_h - fh) // 2)
+
+    app = App()
+    view = app.render_initial()
+    status = f"{len(app.entries)} entries loaded" if app.entries else "welcome — try: add mood <text> #tag"
+    buf, cursor = [], 0
+    history, hist_idx = [], 0
+
+    while True:
+        stdscr.erase()
+        draw_chrome(stdscr, x0, y0, fw, fh, "GRIMOIRE", pair)
+        content_top = y0 + 3
+        for i in range(content_h):
+            line = view[i] if i < len(view) else ""
+            draw_row(stdscr, x0, content_top + i, inner_w, line, pair)
+        draw_row(stdscr, x0, content_top + content_h, inner_w, "◆ " + status, pair)
+        safe_addstr(stdscr, content_top + content_h + 1, x0, "├" + "─" * inner_w + "┤", pair)
+        input_y = content_top + content_h + 2
+        prompt = "> " + "".join(buf)
+        draw_row(stdscr, x0, input_y, inner_w, prompt, pair)
+        safe_addstr(stdscr, y0 + fh - 1, x0, "└" + "─" * inner_w + "┘", pair)
+        try:
+            stdscr.move(input_y, x0 + 1 + 2 + cursor)
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch in (10, 13, curses.KEY_ENTER):
+            raw = "".join(buf)
+            if raw.strip():
+                history.append(raw)
+            hist_idx = len(history)
+            result = app.dispatch(raw)
+            if result is QUIT:
+                break
+            view, status = result
+            buf, cursor = [], 0
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            if cursor > 0:
+                del buf[cursor - 1]
+                cursor -= 1
+        elif ch == curses.KEY_DC:
+            if cursor < len(buf):
+                del buf[cursor]
+        elif ch == curses.KEY_LEFT:
+            cursor = max(0, cursor - 1)
+        elif ch == curses.KEY_RIGHT:
+            cursor = min(len(buf), cursor + 1)
+        elif ch == curses.KEY_HOME:
+            cursor = 0
+        elif ch == curses.KEY_END:
+            cursor = len(buf)
+        elif ch == curses.KEY_UP:
+            if history and hist_idx > 0:
+                hist_idx -= 1
+                buf = list(history[hist_idx])
+                cursor = len(buf)
+        elif ch == curses.KEY_DOWN:
+            if hist_idx < len(history) - 1:
+                hist_idx += 1
+                buf = list(history[hist_idx])
+                cursor = len(buf)
+            else:
+                hist_idx = len(history)
+                buf, cursor = [], 0
+        elif ch == curses.KEY_RESIZE:
+            continue
+        elif 32 <= ch < 127:
+            buf.insert(cursor, chr(ch))
+            cursor += 1
+
+
+if __name__ == "__main__":
+    curses.wrapper(main)

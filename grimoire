@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """grimoire — a small vertical retro-mac terminal widget for cataloguing
 aesthetics/moods/motifs and pulling a random seed set to build a concept from.
-stdlib only (curses) — deliberately not run via `uv run --script`.
+stdlib only (curses + tkinter) — deliberately not run via `uv run --script`:
+uv's managed cpython builds don't reliably ship a working Tcl/Tk, tkinter fails there.
 """
 
+import argparse
 import curses
 import json
+import os
 import random
 import re
+import sys
 import textwrap
+import tkinter as tk
+import tkinter.font as tkfont
 from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
@@ -249,30 +255,108 @@ def safe_addstr(stdscr, y, x, text, attr=0):
         pass
 
 
-def draw_chrome(stdscr, x0, y0, fw, fh, title, pair):
-    inner_w = fw - 2
-    safe_addstr(stdscr, y0, x0, "┌" + "─" * inner_w + "┐", pair)
+# ---------------------------------------------------------------------------
+# shared chrome/content rendering — a plain list[str] box, used by both the
+# curses backend (blitted at an x0,y0 offset inside the real terminal) and
+# the tkinter backend (the box IS the whole window, no host terminal).
+# ---------------------------------------------------------------------------
+
+def render_box_lines(view, status, buf, cursor, fw, fh, inner_w, content_h, title):
+    """returns (lines, title_row, input_row, input_col) — lines[i] is exactly
+    fw chars wide; title_row/input_row are indices into lines; input_col is
+    the char column (within the line) where the text-entry cursor sits."""
+    lines = []
+    lines.append("┌" + "─" * inner_w + "┐")
+
     left_box, right_box = "[■]", "[■]"
     label = f" {title} "
     stripe_total = max(0, inner_w - len(left_box) - len(right_box) - len(label))
     left_stripe = "·" * (stripe_total // 2)
     right_stripe = "·" * (stripe_total - stripe_total // 2)
     title_line = (left_box + left_stripe + label + right_stripe + right_box)[:inner_w].ljust(inner_w)
-    safe_addstr(stdscr, y0 + 1, x0, "│", pair)
-    safe_addstr(stdscr, y0 + 1, x0 + 1, title_line, pair | curses.A_BOLD)
-    safe_addstr(stdscr, y0 + 1, x0 + fw - 1, "│", pair)
-    safe_addstr(stdscr, y0 + 2, x0, "├" + "─" * inner_w + "┤", pair)
-    for row in range(y0 + 3, y0 + fh - 1):
-        safe_addstr(stdscr, row, x0, "│" + " " * inner_w + "│", pair)
-    safe_addstr(stdscr, y0 + fh - 1, x0, "└" + "─" * inner_w + "┘", pair)
+    lines.append("│" + title_line + "│")
+    title_row = 1
+
+    lines.append("├" + "─" * inner_w + "┤")
+
+    for i in range(content_h):
+        text = (view[i] if i < len(view) else "")[:inner_w].ljust(inner_w)
+        lines.append("│" + text + "│")
+
+    status_text = ("◆ " + status)[:inner_w].ljust(inner_w)
+    lines.append("│" + status_text + "│")
+    lines.append("├" + "─" * inner_w + "┤")
+
+    prompt = "> " + "".join(buf)
+    input_row = len(lines)
+    lines.append("│" + prompt[:inner_w].ljust(inner_w) + "│")
+    input_col = 1 + 2 + cursor
+
+    lines.append("└" + "─" * inner_w + "┘")
+
+    return lines, title_row, input_row, input_col
 
 
-def draw_row(stdscr, x0, y, inner_w, text, pair, attr=0):
-    text = (text or "")[:inner_w].ljust(inner_w)
-    safe_addstr(stdscr, y, x0 + 1, text, pair | attr)
+CONTENT_H, INNER_W = 18, 34
 
 
-def main(stdscr):
+def handle_key(app, buf, cursor, history, hist_idx, control):
+    """apply one logical keypress. `control` is one of the KEY_* sentinels
+    below, or a single printable character. returns (buf, cursor, hist_idx,
+    view_status_or_None) — view_status_or_None is (view, status) on submit,
+    QUIT on quit, else None."""
+    if control == "ENTER":
+        raw = "".join(buf)
+        if raw.strip():
+            history.append(raw)
+        hist_idx = len(history)
+        result = app.dispatch(raw)
+        if result is QUIT:
+            return buf, cursor, hist_idx, QUIT
+        return [], 0, hist_idx, result
+    if control == "BACKSPACE":
+        if cursor > 0:
+            del buf[cursor - 1]
+            cursor -= 1
+    elif control == "DELETE":
+        if cursor < len(buf):
+            del buf[cursor]
+    elif control == "LEFT":
+        cursor = max(0, cursor - 1)
+    elif control == "RIGHT":
+        cursor = min(len(buf), cursor + 1)
+    elif control == "HOME":
+        cursor = 0
+    elif control == "END":
+        cursor = len(buf)
+    elif control == "UP":
+        if history and hist_idx > 0:
+            hist_idx -= 1
+            buf = list(history[hist_idx])
+            cursor = len(buf)
+    elif control == "DOWN":
+        if hist_idx < len(history) - 1:
+            hist_idx += 1
+            buf = list(history[hist_idx])
+            cursor = len(buf)
+        else:
+            hist_idx = len(history)
+            buf, cursor = [], 0
+    elif isinstance(control, str) and len(control) == 1:
+        buf.insert(cursor, control)
+        cursor += 1
+    return buf, cursor, hist_idx, None
+
+
+# ---------------------------------------------------------------------------
+# curses backend
+# ---------------------------------------------------------------------------
+
+def cmd_tui(_args):
+    curses.wrapper(_curses_main)
+
+
+def _curses_main(stdscr):
     curses.curs_set(1)
     curses.start_color()
     curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
@@ -280,7 +364,7 @@ def main(stdscr):
     stdscr.keypad(True)
 
     term_h, term_w = stdscr.getmaxyx()
-    content_h, inner_w = 18, 34
+    content_h, inner_w = CONTENT_H, INNER_W
     fw, fh = inner_w + 2, content_h + 7
     while fh > term_h - 1 and content_h > 8:
         content_h -= 1
@@ -305,69 +389,194 @@ def main(stdscr):
     history, hist_idx = [], 0
 
     while True:
+        lines, _title_row, input_row, input_col = render_box_lines(
+            view, status, buf, cursor, fw, fh, inner_w, content_h, "GRIMOIRE")
         stdscr.erase()
-        draw_chrome(stdscr, x0, y0, fw, fh, "GRIMOIRE", pair)
-        content_top = y0 + 3
-        for i in range(content_h):
-            line = view[i] if i < len(view) else ""
-            draw_row(stdscr, x0, content_top + i, inner_w, line, pair)
-        draw_row(stdscr, x0, content_top + content_h, inner_w, "◆ " + status, pair)
-        safe_addstr(stdscr, content_top + content_h + 1, x0, "├" + "─" * inner_w + "┤", pair)
-        input_y = content_top + content_h + 2
-        prompt = "> " + "".join(buf)
-        draw_row(stdscr, x0, input_y, inner_w, prompt, pair)
-        safe_addstr(stdscr, y0 + fh - 1, x0, "└" + "─" * inner_w + "┘", pair)
+        for i, line in enumerate(lines):
+            attr = pair | (curses.A_BOLD if i == 1 else 0)
+            safe_addstr(stdscr, y0 + i, x0, line, attr)
         try:
-            stdscr.move(input_y, x0 + 1 + 2 + cursor)
+            stdscr.move(y0 + input_row, x0 + input_col)
         except curses.error:
             pass
         stdscr.refresh()
 
         ch = stdscr.getch()
         if ch in (10, 13, curses.KEY_ENTER):
-            raw = "".join(buf)
-            if raw.strip():
-                history.append(raw)
-            hist_idx = len(history)
-            result = app.dispatch(raw)
-            if result is QUIT:
-                break
-            view, status = result
-            buf, cursor = [], 0
+            control = "ENTER"
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
-            if cursor > 0:
-                del buf[cursor - 1]
-                cursor -= 1
+            control = "BACKSPACE"
         elif ch == curses.KEY_DC:
-            if cursor < len(buf):
-                del buf[cursor]
+            control = "DELETE"
         elif ch == curses.KEY_LEFT:
-            cursor = max(0, cursor - 1)
+            control = "LEFT"
         elif ch == curses.KEY_RIGHT:
-            cursor = min(len(buf), cursor + 1)
+            control = "RIGHT"
         elif ch == curses.KEY_HOME:
-            cursor = 0
+            control = "HOME"
         elif ch == curses.KEY_END:
-            cursor = len(buf)
+            control = "END"
         elif ch == curses.KEY_UP:
-            if history and hist_idx > 0:
-                hist_idx -= 1
-                buf = list(history[hist_idx])
-                cursor = len(buf)
+            control = "UP"
         elif ch == curses.KEY_DOWN:
-            if hist_idx < len(history) - 1:
-                hist_idx += 1
-                buf = list(history[hist_idx])
-                cursor = len(buf)
-            else:
-                hist_idx = len(history)
-                buf, cursor = [], 0
+            control = "DOWN"
         elif ch == curses.KEY_RESIZE:
             continue
         elif 32 <= ch < 127:
-            buf.insert(cursor, chr(ch))
-            cursor += 1
+            control = chr(ch)
+        else:
+            continue
+
+        buf, cursor, hist_idx, result = handle_key(app, buf, cursor, history, hist_idx, control)
+        if result is QUIT:
+            break
+        if result is not None:
+            view, status = result
+
+
+# ---------------------------------------------------------------------------
+# tkinter backend ("window" mode — standalone desktop widget, no host
+# terminal emulator; the ASCII box drawn above IS the whole window)
+# ---------------------------------------------------------------------------
+
+_TK_KEYSYM_TO_CONTROL = {
+    "Return": "ENTER", "KP_Enter": "ENTER",
+    "BackSpace": "BACKSPACE", "Delete": "DELETE",
+    "Left": "LEFT", "Right": "RIGHT", "Home": "HOME", "End": "END",
+    "Up": "UP", "Down": "DOWN",
+}
+
+
+def cmd_window(args):
+    if not args.fg:
+        _daemonize()
+
+    app = App()
+    state = {
+        "view": app.render_initial(),
+        "status": f"{len(app.entries)} entries loaded" if app.entries else "welcome — try: add mood <text> #tag",
+        "buf": [], "cursor": 0, "history": [], "hist_idx": 0,
+    }
+
+    inner_w, content_h = INNER_W, args.rows or CONTENT_H
+    fw, fh = inner_w + 2, content_h + 7
+
+    root = tk.Tk(className="grimoire")
+    root.title("grimoire")
+    font_name = "Terminus" if _font_available("Terminus") else "DejaVu Sans Mono"
+    font = (font_name, args.font_size)
+    tk_font = tkfont.Font(root=root, font=font)
+    char_w = tk_font.measure("0") or 8
+    char_h = tk_font.metrics("linespace") or 16
+
+    text = tk.Text(root, bg="#ffffff", fg="#000000", font=font, bd=0, highlightthickness=0,
+                    insertontime=0, cursor="arrow", wrap="none", takefocus=True)
+    text.tag_configure("bold", font=(font_name, args.font_size, "bold"))
+    text.tag_configure("cursor", background="#000000", foreground="#ffffff")
+    text.pack(fill="both", expand=True)
+    text.config(state="disabled")
+
+    width_px = fw * char_w
+    height_px = fh * char_h
+    if args.geometry:
+        root.geometry(args.geometry)
+    else:
+        sx = (root.winfo_screenwidth() - width_px) // 2
+        sy = (root.winfo_screenheight() - height_px) // 2
+        root.geometry(f"{width_px}x{height_px}+{max(0, sx)}+{max(0, sy)}")
+    root.resizable(False, False)
+
+    def render():
+        lines, title_row, input_row, input_col = render_box_lines(
+            state["view"], state["status"], state["buf"], state["cursor"],
+            fw, fh, inner_w, content_h, "GRIMOIRE")
+        text.config(state="normal")
+        text.delete("1.0", "end")
+        for i, line in enumerate(lines):
+            if i == input_row and 0 <= input_col < len(line):
+                text.insert("end", line[:input_col])
+                text.insert("end", line[input_col], ("cursor",))
+                text.insert("end", line[input_col + 1:])
+            elif i == title_row:
+                text.insert("end", line, ("bold",))
+            else:
+                text.insert("end", line)
+            text.insert("end", "\n")
+        text.config(state="disabled")
+
+    def on_key(event):
+        keysym = event.keysym
+        if keysym == "Escape":
+            root.destroy()
+            return "break"
+        control = _TK_KEYSYM_TO_CONTROL.get(keysym)
+        if control is None:
+            ch = event.char
+            if not ch or not (32 <= ord(ch) < 127):
+                return "break"
+            control = ch
+        buf, cursor, hist_idx, result = handle_key(
+            app, state["buf"], state["cursor"], state["history"], state["hist_idx"], control)
+        if result is QUIT:
+            root.destroy()
+            return "break"
+        state["buf"], state["cursor"], state["hist_idx"] = buf, cursor, hist_idx
+        if result is not None:
+            state["view"], state["status"] = result
+        render()
+        return "break"
+
+    root.bind("<Key>", on_key)
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    render()
+    text.focus_set()
+    root.mainloop()
+
+
+def _font_available(name: str) -> bool:
+    try:
+        return name in tkfont.families()
+    except Exception:
+        return False
+
+
+def _daemonize():
+    if os.fork() > 0:
+        sys.exit(0)
+    os.setsid()
+    if os.fork() > 0:
+        sys.exit(0)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    os.dup2(devnull, 0)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+
+
+# ---------------------------------------------------------------------------
+# cli
+# ---------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(prog="grimoire", description="retro-mac aesthetics catalogue")
+    sub = p.add_subparsers(dest="command")
+
+    p_tui = sub.add_parser("tui", help="run in the current terminal (default)")
+    p_tui.set_defaults(func=cmd_tui)
+
+    p_win = sub.add_parser("window", help="open a standalone desktop widget window")
+    p_win.add_argument("--geometry", default=None, help="e.g. 320x480+100+100")
+    p_win.add_argument("--font-size", type=int, default=13)
+    p_win.add_argument("--rows", type=int, default=None, help="content rows (default 18)")
+    p_win.add_argument("--fg", action="store_true", help="stay attached to this shell instead of daemonizing")
+    p_win.set_defaults(func=cmd_window)
+
+    args = p.parse_args()
+    if args.command is None:
+        args.func = cmd_tui
+    args.func(args)
 
 
 if __name__ == "__main__":
-    curses.wrapper(main)
+    main()

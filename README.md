@@ -4,13 +4,18 @@ a small vertical retro-mac terminal widget for cataloguing the aesthetics,
 moods, and motifs you keep coming back to — then pulling a random set from
 that catalogue to seed a new project.
 
-stdlib-only Python (`curses`), single file, no dependencies.
+stdlib-only Python (`curses` + `tkinter`), single file, no dependencies.
 
 ## run
 
 ```
-grimoire
+grimoire            # in-terminal, same as `grimoire tui`
+grimoire window      # standalone desktop widget — no host terminal, draws its own mac-style chrome
 ```
+
+`window` mode opens its own top-level window (WM_CLASS `grimoire`) and
+daemonizes by default; pass `--fg` to keep it attached to the launching
+shell, `--geometry WxH+X+Y` to place it, `--font-size N` to resize.
 
 (symlinked at `~/.local/bin/grimoire` → `grimoire` in this repo)
 

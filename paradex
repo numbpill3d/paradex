@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""grimoire — a small vertical retro-mac terminal widget for cataloguing
+"""paradex — a small vertical retro-mac terminal widget for cataloguing
 aesthetics/moods/motifs and pulling a random seed set to build a concept from.
 stdlib only (curses + tkinter) — deliberately not run via `uv run --script`:
 uv's managed cpython builds don't reliably ship a working Tcl/Tk, tkinter fails there.
@@ -19,7 +19,7 @@ from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
 
-DB_PATH = Path.home() / ".local/share/grimoire/db.json"
+DB_PATH = Path.home() / ".local/share/paradex/db.json"
 BUILDS_DIR = Path(__file__).resolve().parent / "builds"
 
 HELP_TEXT = [
@@ -228,14 +228,14 @@ class App:
 
     def render_initial(self):
         if not self.entries:
-            return ["welcome to grimoire.", "", "file the aesthetics you keep", "coming back to. pull a random", "set later to seed a concept.", "", "try:", "  add mood <text> #tag", "  help"]
+            return ["welcome to paradex.", "", "file the aesthetics you keep", "coming back to. pull a random", "set later to seed a concept.", "", "try:", "  add mood <text> #tag", "  help"]
         return self.render_list_view(list(self.entries))
 
     def _build_sheet(self, name, entries):
         by_cat = {}
         for e in entries:
             by_cat.setdefault(e["category"], []).append(e)
-        out = [f"GRIMOIRE BUILD SHEET — {name}", f"generated {date.today().isoformat()}", ""]
+        out = [f"PARADEX BUILD SHEET — {name}", f"generated {date.today().isoformat()}", ""]
         for cat, es in sorted(by_cat.items()):
             out.append(cat.upper())
             for e in es:
@@ -390,7 +390,7 @@ def _curses_main(stdscr):
 
     while True:
         lines, _title_row, input_row, input_col = render_box_lines(
-            view, status, buf, cursor, fw, fh, inner_w, content_h, "GRIMOIRE")
+            view, status, buf, cursor, fw, fh, inner_w, content_h, "PARADEX")
         stdscr.erase()
         for i, line in enumerate(lines):
             attr = pair | (curses.A_BOLD if i == 1 else 0)
@@ -461,8 +461,8 @@ def cmd_window(args):
     inner_w, content_h = INNER_W, args.rows or CONTENT_H
     fw, fh = inner_w + 2, content_h + 7
 
-    root = tk.Tk(className="grimoire")
-    root.title("grimoire")
+    root = tk.Tk(className="paradex")
+    root.title("paradex")
     font_name = "Terminus" if _font_available("Terminus") else "DejaVu Sans Mono"
     font = (font_name, args.font_size)
     tk_font = tkfont.Font(root=root, font=font)
@@ -489,7 +489,7 @@ def cmd_window(args):
     def render():
         lines, title_row, input_row, input_col = render_box_lines(
             state["view"], state["status"], state["buf"], state["cursor"],
-            fw, fh, inner_w, content_h, "GRIMOIRE")
+            fw, fh, inner_w, content_h, "PARADEX")
         text.config(state="normal")
         text.delete("1.0", "end")
         for i, line in enumerate(lines):
@@ -530,6 +530,8 @@ def cmd_window(args):
     root.protocol("WM_DELETE_WINDOW", root.destroy)
     render()
     text.focus_set()
+    root.lift()
+    root.focus_force()
     root.mainloop()
 
 
@@ -559,7 +561,7 @@ def _daemonize():
 # ---------------------------------------------------------------------------
 
 def main():
-    p = argparse.ArgumentParser(prog="grimoire", description="retro-mac aesthetics catalogue")
+    p = argparse.ArgumentParser(prog="paradex", description="retro-mac aesthetics catalogue")
     sub = p.add_subparsers(dest="command")
 
     p_tui = sub.add_parser("tui", help="run in the current terminal (default)")

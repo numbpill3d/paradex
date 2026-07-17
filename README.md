@@ -1,4 +1,4 @@
-# grimoire
+# paradex
 
 a small vertical retro-mac terminal widget for cataloguing the aesthetics,
 moods, and motifs you keep coming back to — then pulling a random set from
@@ -9,15 +9,15 @@ stdlib-only Python (`curses` + `tkinter`), single file, no dependencies.
 ## run
 
 ```
-grimoire            # in-terminal, same as `grimoire tui`
-grimoire window      # standalone desktop widget — no host terminal, draws its own mac-style chrome
+paradex            # in-terminal, same as `paradex tui`
+paradex window      # standalone desktop widget — no host terminal, draws its own mac-style chrome
 ```
 
-`window` mode opens its own top-level window (WM_CLASS `grimoire`) and
+`window` mode opens its own top-level window (WM_CLASS `paradex`) and
 daemonizes by default; pass `--fg` to keep it attached to the launching
 shell, `--geometry WxH+X+Y` to place it, `--font-size N` to resize.
 
-(symlinked at `~/.local/bin/grimoire` → `grimoire` in this repo)
+(symlinked at `~/.local/bin/paradex` → `paradex` in this repo)
 
 ## commands
 
@@ -51,5 +51,5 @@ what you're building.
 
 ## storage
 
-entries persist to `~/.local/share/grimoire/db.json`. build sheets land in
+entries persist to `~/.local/share/paradex/db.json`. build sheets land in
 `builds/` inside this repo (gitignored — personal output, not source).

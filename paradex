@@ -25,22 +25,33 @@ BUILDS_DIR = Path(__file__).resolve().parent / "builds"
 HELP_TEXT = [
     "commands:",
     "  add <category> <text> [#tag ...]   file a new entry",
+    "  edit <id> <text>                   replace an entry's text",
     "  list [category|#tag]  (ls)         show entries, optionally filtered",
     "  tag <id> #tag [#tag ...]           add tags to an entry",
+    "  untag <id> #tag [#tag ...]         remove tags from an entry",
+    "  mv <id> <category>                 recategorize an entry",
     "  rm <id>  (del)                     remove an entry",
     "  roll [n] [category|#tag]           randomly pull n entries (default 3)",
     "  build [name]                       save the last roll as a build sheet",
+    "  export [category|#tag]             dump matching entries to builds/",
     "  categories  (cat)                  list categories + counts",
+    "  tags                               list tags + counts",
+    "  stats                              catalogue summary",
     "  find <term>                        search text/tags/category",
     "  clear                              drop the active filter",
+    "  undo                               revert the last change",
     "  help                               this",
     "  quit  (:q, exit)                   leave",
     "",
     "examples:",
     "  add palette black voidscape, red neon veins #hackercore #ritual",
     "  add mood restless midnight circuitry #glitch",
+    "  edit 3 restless 3am circuitry hum",
+    "  mv 3 texture",
+    "  untag 3 #glitch",
     "  roll 3 #hackercore",
     "  build my-next-thing",
+    "  export #hackercore",
 ]
 
 QUIT = object()
@@ -50,6 +61,10 @@ class App:
     def __init__(self):
         self.entries, self.next_id = self._load()
         self.last_roll = []
+        self._undo = None
+
+    def _snapshot(self):
+        self._undo = (json.dumps(self.entries), self.next_id)
 
     def _load(self):
         if not DB_PATH.exists():
@@ -84,25 +99,42 @@ class App:
         if cmd in ("quit", "exit", ":q"):
             return QUIT
         if cmd in ("", "help", "?"):
-            return list(HELP_TEXT), "commands: add, list, tag, rm, roll, build, categories, find, clear, help, quit"
+            return list(HELP_TEXT), (
+                "commands: add, edit, list, tag, untag, mv, rm, roll, build, export, "
+                "categories, tags, stats, find, clear, undo, help, quit"
+            )
         if cmd == "add":
             return self._cmd_add(rest)
+        if cmd == "edit":
+            return self._cmd_edit(rest)
         if cmd in ("list", "ls"):
             return self._cmd_list(rest)
         if cmd == "tag":
             return self._cmd_tag(rest)
+        if cmd == "untag":
+            return self._cmd_untag(rest)
+        if cmd == "mv":
+            return self._cmd_mv(rest)
         if cmd in ("rm", "del"):
             return self._cmd_rm(rest)
         if cmd == "roll":
             return self._cmd_roll(rest)
         if cmd == "build":
             return self._cmd_build(rest)
+        if cmd == "export":
+            return self._cmd_export(rest)
         if cmd in ("categories", "cat"):
             return self._cmd_categories(rest)
+        if cmd == "tags":
+            return self._cmd_tags(rest)
+        if cmd == "stats":
+            return self._cmd_stats(rest)
         if cmd == "find":
             return self._cmd_find(rest)
         if cmd == "clear":
             return self.render_list_view(list(self.entries)), "filter cleared"
+        if cmd == "undo":
+            return self._cmd_undo(rest)
         return [f"unknown command: '{cmd}'", "try 'help' for the command list"], f"unknown command '{cmd}'"
 
     def _cmd_add(self, rest):
@@ -115,12 +147,32 @@ class App:
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             return ["entry text is empty"], "error: entry text is empty"
+        self._snapshot()
         eid = self.next_id
         self.next_id += 1
         entry = {"id": eid, "category": category, "text": text, "tags": tags, "created": date.today().isoformat()}
         self.entries.append(entry)
         self._save()
         return self.render_list_view(list(self.entries)), f"added [{eid}] {category}"
+
+    def _cmd_edit(self, rest):
+        parts = rest.split(None, 1)
+        if len(parts) < 2:
+            return ["usage: edit <id> <new text>"], "error: need an id and new text"
+        try:
+            eid = int(parts[0])
+        except ValueError:
+            return [f"'{parts[0]}' is not a valid id"], "error: bad id"
+        entry = next((e for e in self.entries if e["id"] == eid), None)
+        if entry is None:
+            return [f"no entry [{eid}]"], f"error: no entry [{eid}]"
+        text = re.sub(r"\s+", " ", parts[1]).strip()
+        if not text:
+            return ["entry text is empty"], "error: entry text is empty"
+        self._snapshot()
+        entry["text"] = text
+        self._save()
+        return self.render_list_view([entry]), f"edited [{eid}]"
 
     def _cmd_list(self, rest):
         filtered = self._filter(rest)
@@ -140,9 +192,47 @@ class App:
         if entry is None:
             return [f"no entry [{eid}]"], f"error: no entry [{eid}]"
         new_tags = sorted({t.lstrip("#").lower() for t in parts[1:]})
+        self._snapshot()
         entry["tags"] = sorted(set(entry["tags"]) | set(new_tags))
         self._save()
         return self.render_list_view([entry]), f"tagged [{eid}]: +" + " +".join(new_tags)
+
+    def _cmd_untag(self, rest):
+        parts = rest.split()
+        if len(parts) < 2:
+            return ["usage: untag <id> #tag [#tag ...]"], "error: need an id and at least one tag"
+        try:
+            eid = int(parts[0])
+        except ValueError:
+            return [f"'{parts[0]}' is not a valid id"], "error: bad id"
+        entry = next((e for e in self.entries if e["id"] == eid), None)
+        if entry is None:
+            return [f"no entry [{eid}]"], f"error: no entry [{eid}]"
+        drop = sorted({t.lstrip("#").lower() for t in parts[1:]})
+        self._snapshot()
+        entry["tags"] = sorted(set(entry["tags"]) - set(drop))
+        self._save()
+        return self.render_list_view([entry]), f"untagged [{eid}]: -" + " -".join(drop)
+
+    def _cmd_mv(self, rest):
+        parts = rest.split(None, 1)
+        if len(parts) < 2:
+            return ["usage: mv <id> <category>"], "error: need an id and a category"
+        try:
+            eid = int(parts[0])
+        except ValueError:
+            return [f"'{parts[0]}' is not a valid id"], "error: bad id"
+        entry = next((e for e in self.entries if e["id"] == eid), None)
+        if entry is None:
+            return [f"no entry [{eid}]"], f"error: no entry [{eid}]"
+        new_cat = parts[1].strip().lower()
+        if not new_cat:
+            return ["usage: mv <id> <category>"], "error: empty category"
+        self._snapshot()
+        old_cat = entry["category"]
+        entry["category"] = new_cat
+        self._save()
+        return self.render_list_view([entry]), f"moved [{eid}]: {old_cat} -> {new_cat}"
 
     def _cmd_rm(self, rest):
         try:
@@ -150,11 +240,23 @@ class App:
         except ValueError:
             return ["usage: rm <id>"], "error: bad id"
         before = len(self.entries)
+        self._snapshot()
         self.entries = [e for e in self.entries if e["id"] != eid]
         if len(self.entries) == before:
+            self._undo = None
             return [f"no entry [{eid}]"], f"error: no entry [{eid}]"
         self._save()
         return self.render_list_view(list(self.entries)), f"removed [{eid}]"
+
+    def _cmd_undo(self, rest):
+        if self._undo is None:
+            return ["nothing to undo"], "error: no undo history"
+        entries_json, next_id = self._undo
+        self.entries = json.loads(entries_json)
+        self.next_id = next_id
+        self._undo = None
+        self._save()
+        return self.render_list_view(list(self.entries)), "undone — reverted last change"
 
     def _cmd_roll(self, rest):
         parts = rest.split()
@@ -175,6 +277,22 @@ class App:
         if not self.last_roll:
             return ["nothing rolled yet — try 'roll' first."], "error: nothing to build from"
         name = rest.strip() or datetime.now().strftime("seed-%Y%m%d-%H%M%S")
+        path = self._build_path(name)
+        content = self._build_sheet(name, self.last_roll)
+        path.write_text(content)
+        return content.splitlines(), f"saved -> builds/{path.name}"
+
+    def _cmd_export(self, rest):
+        entries = self._filter(rest)
+        if not entries:
+            return ["no entries match — nothing to export."], "error: nothing to export"
+        label = rest.strip() or "full catalogue"
+        path = self._build_path(f"export-{label}")
+        content = self._build_sheet(label, entries, kind="EXPORT")
+        path.write_text(content)
+        return content.splitlines(), f"saved -> builds/{path.name}"
+
+    def _build_path(self, name):
         slug = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or "seed"
         BUILDS_DIR.mkdir(parents=True, exist_ok=True)
         path = BUILDS_DIR / f"{slug}.txt"
@@ -182,9 +300,7 @@ class App:
         while path.exists():
             path = BUILDS_DIR / f"{slug}-{i}.txt"
             i += 1
-        content = self._build_sheet(name, self.last_roll)
-        path.write_text(content)
-        return content.splitlines(), f"saved -> builds/{path.name}"
+        return path
 
     def _cmd_categories(self, rest):
         counts = Counter(e["category"] for e in self.entries)
@@ -192,6 +308,33 @@ class App:
             return ["(no entries yet)"], "0 categories"
         lines = [f"{cat}  ({n})" for cat, n in sorted(counts.items(), key=lambda kv: -kv[1])]
         return lines, f"{len(counts)} categories, {len(self.entries)} entries total"
+
+    def _cmd_tags(self, rest):
+        counts = Counter(t for e in self.entries for t in e["tags"])
+        if not counts:
+            return ["(no tags yet)"], "0 tags"
+        lines = [f"#{tag}  ({n})" for tag, n in sorted(counts.items(), key=lambda kv: -kv[1])]
+        return lines, f"{len(counts)} tags"
+
+    def _cmd_stats(self, rest):
+        if not self.entries:
+            return ["(no entries yet)"], "0 entries"
+        cats = Counter(e["category"] for e in self.entries)
+        tags = Counter(t for e in self.entries for t in e["tags"])
+        dates = sorted(e["created"] for e in self.entries)
+        lines = [
+            f"{len(self.entries)} entries",
+            f"{len(cats)} categories, {len(tags)} tags",
+            f"oldest {dates[0]}  newest {dates[-1]}",
+            "",
+            "top categories:",
+        ]
+        lines += [f"  {cat} ({n})" for cat, n in cats.most_common(3)]
+        if tags:
+            lines.append("")
+            lines.append("top tags:")
+            lines += [f"  #{tag} ({n})" for tag, n in tags.most_common(3)]
+        return lines, f"{len(self.entries)} entries total"
 
     def _cmd_find(self, rest):
         term = rest.strip().lower()
@@ -231,20 +374,21 @@ class App:
             return ["welcome to paradex.", "", "file the aesthetics you keep", "coming back to. pull a random", "set later to seed a concept.", "", "try:", "  add mood <text> #tag", "  help"]
         return self.render_list_view(list(self.entries))
 
-    def _build_sheet(self, name, entries):
+    def _build_sheet(self, name, entries, kind="BUILD SHEET"):
         by_cat = {}
         for e in entries:
             by_cat.setdefault(e["category"], []).append(e)
-        out = [f"PARADEX BUILD SHEET — {name}", f"generated {date.today().isoformat()}", ""]
+        out = [f"PARADEX {kind} — {name}", f"generated {date.today().isoformat()}", ""]
         for cat, es in sorted(by_cat.items()):
             out.append(cat.upper())
             for e in es:
                 tagstr = (" [" + " ".join("#" + t for t in e["tags"]) + "]") if e["tags"] else ""
                 out.append(f"  - {e['text']}{tagstr}")
             out.append("")
-        out.append("---")
-        out.append("seed for:")
-        out.append("")
+        if kind == "BUILD SHEET":
+            out.append("---")
+            out.append("seed for:")
+            out.append("")
         return "\n".join(out)
 
 
@@ -264,7 +408,10 @@ def safe_addstr(stdscr, y, x, text, attr=0):
 def render_box_lines(view, status, buf, cursor, fw, fh, inner_w, content_h, title):
     """returns (lines, title_row, input_row, input_col) — lines[i] is exactly
     fw chars wide; title_row/input_row are indices into lines; input_col is
-    the char column (within the line) where the text-entry cursor sits."""
+    the char column (within the line) where the text-entry cursor sits.
+
+    border is a subtle bevel: crisp "─│" on the top/left (raised edge), soft
+    "░" shade on the bottom/right (recessed edge) — glyph-only, no color."""
     lines = []
     lines.append("┌" + "─" * inner_w + "┐")
 
@@ -274,25 +421,34 @@ def render_box_lines(view, status, buf, cursor, fw, fh, inner_w, content_h, titl
     left_stripe = "·" * (stripe_total // 2)
     right_stripe = "·" * (stripe_total - stripe_total // 2)
     title_line = (left_box + left_stripe + label + right_stripe + right_box)[:inner_w].ljust(inner_w)
-    lines.append("│" + title_line + "│")
+    lines.append("│" + title_line + "░")
     title_row = 1
 
     lines.append("├" + "─" * inner_w + "┤")
 
     for i in range(content_h):
         text = (view[i] if i < len(view) else "")[:inner_w].ljust(inner_w)
-        lines.append("│" + text + "│")
+        lines.append("│" + text + "░")
 
     status_text = ("◆ " + status)[:inner_w].ljust(inner_w)
-    lines.append("│" + status_text + "│")
+    lines.append("│" + status_text + "░")
     lines.append("├" + "─" * inner_w + "┤")
 
-    prompt = "> " + "".join(buf)
+    full_prompt = "> " + "".join(buf)
+    cursor_pos = 2 + cursor
+    if len(full_prompt) <= inner_w:
+        view_start = 0
+    else:
+        max_start = len(full_prompt) - inner_w
+        view_start = min(max(cursor_pos - inner_w + 1, 0), max_start)
+        if cursor_pos < view_start:
+            view_start = cursor_pos
+    visible = full_prompt[view_start:view_start + inner_w].ljust(inner_w)
     input_row = len(lines)
-    lines.append("│" + prompt[:inner_w].ljust(inner_w) + "│")
-    input_col = 1 + 2 + cursor
+    lines.append("│" + visible + "░")
+    input_col = 1 + (cursor_pos - view_start)
 
-    lines.append("└" + "─" * inner_w + "┘")
+    lines.append("░" * (inner_w + 2))
 
     return lines, title_row, input_row, input_col
 

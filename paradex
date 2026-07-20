@@ -20,7 +20,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 DB_PATH = Path.home() / ".local/share/paradex/db.json"
-BUILDS_DIR = Path(__file__).resolve().parent / "builds"
+BUILDS_DIR = Path.home() / ".local/share/paradex/builds"
 PROJECT_STATUSES = ("seed", "active", "shelved", "done")
 
 HELP_TEXT = [

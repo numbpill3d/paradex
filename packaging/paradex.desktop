@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=paradex
+GenericName=Aesthetics Catalogue
+Comment=Retro-mac widget for cataloguing moods/palettes/textures and rolling concept seeds
+Exec=paradex window
+Icon=paradex
+Terminal=false
+Categories=Utility;Art;
+Keywords=aesthetics;mood;palette;catalogue;seed;brainstorm;ritual;sigil;
+StartupNotify=true
+StartupWMClass=paradex

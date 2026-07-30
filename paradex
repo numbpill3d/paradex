@@ -22,9 +22,11 @@ from pathlib import Path
 DB_PATH = Path.home() / ".local/share/paradex/db.json"
 BUILDS_DIR = Path.home() / ".local/share/paradex/builds"
 PROJECT_STATUSES = ("seed", "active", "shelved", "done")
+UNSORTED_CATEGORY = "unsorted"
 
 HELP_TEXT = [
     "commands:",
+    "  jot <text> [#tag ...]  (+)         quick-capture, no category needed",
     "  add <category> <text> [#tag ...]   file a new entry",
     "  edit <id> <text>                   replace an entry's text",
     "  list [category|#tag|@project]      show entries, optionally filtered",
@@ -60,6 +62,7 @@ HELP_TEXT = [
     "  quit  (:q, exit)                   leave",
     "",
     "examples:",
+    "  jot restless midnight circuitry #glitch",
     "  add palette black voidscape, red neon veins #hackercore #ritual",
     "  add mood restless midnight circuitry #glitch",
     "  link 1 2",
@@ -145,10 +148,12 @@ class App:
             return QUIT
         if cmd in ("", "help", "?"):
             return list(HELP_TEXT), (
-                "commands: add, edit, list, tag, untag, mv, rm, link, unlink, clash, "
+                "commands: jot, add, edit, list, tag, untag, mv, rm, link, unlink, clash, "
                 "unclash, roll, spread, build, export, newproj, projects, pin, unpin, "
                 "status, note, rmproj, categories, tags, stats, find, clear, undo, help, quit"
             )
+        if cmd in ("jot", "+"):
+            return self._cmd_jot(rest)
         if cmd == "add":
             return self._cmd_add(rest)
         if cmd == "edit":
@@ -211,16 +216,14 @@ class App:
 
     # -- entries ----------------------------------------------------------
 
-    def _cmd_add(self, rest):
-        parts = rest.split(None, 1)
-        if len(parts) < 2:
-            return ["usage: add <category> <text> [#tag ...]"], "error: missing category or text"
-        category, remainder = parts[0].lower(), parts[1]
+    def _add_entry(self, category, remainder):
+        """shared by _cmd_add and _cmd_jot. returns (entry, None) on success
+        or (None, (view_line, status)) on a validation error."""
         tags = sorted({t.lower() for t in re.findall(r"#(\S+)", remainder)})
         text = re.sub(r"#\S+", "", remainder)
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
-            return ["entry text is empty"], "error: entry text is empty"
+            return None, ("entry text is empty", "error: entry text is empty")
         self._snapshot()
         eid = self.next_id
         self.next_id += 1
@@ -230,7 +233,27 @@ class App:
         }
         self.entries.append(entry)
         self._save()
-        return self.render_list_view(list(self.entries)), f"added [{eid}] {category}"
+        return entry, None
+
+    def _cmd_add(self, rest):
+        parts = rest.split(None, 1)
+        if len(parts) < 2:
+            return ["usage: add <category> <text> [#tag ...]"], "error: missing category or text"
+        category, remainder = parts[0].lower(), parts[1]
+        entry, err = self._add_entry(category, remainder)
+        if err:
+            return [err[0]], err[1]
+        return self.render_list_view(list(self.entries)), f"added [{entry['id']}] {category}"
+
+    def _cmd_jot(self, rest):
+        if not rest.strip():
+            return (["usage: jot <text> [#tag ...]", "files it under 'unsorted' — no category needed"],
+                     "error: missing text")
+        entry, err = self._add_entry(UNSORTED_CATEGORY, rest)
+        if err:
+            return [err[0]], err[1]
+        return (self.render_list_view(list(self.entries)),
+                f"jotted [{entry['id']}] -> unsorted  (mv {entry['id']} <category> to file it)")
 
     def _cmd_edit(self, rest):
         parts = rest.split(None, 1)
@@ -695,14 +718,14 @@ class App:
 
     def render_initial(self):
         if not self.entries:
-            return ["welcome to paradex.", "", "file the aesthetics you keep", "coming back to. pull a random", "set later to seed a concept.", "", "try:", "  add mood <text> #tag", "  help"]
+            return ["welcome to paradex.", "", "file the aesthetics you keep", "coming back to. pull a random", "set later to seed a concept.", "", "try:", "  jot <text> #tag", "  (no category needed —", "   sort it out later)", "  help"]
         seed = self._daily_seed_entry()
         header = ["◈ today's pull", ""] + self._entry_lines([seed]) + ["", "· " * 17, ""]
         return header + self.render_list_view(list(self.entries))
 
     def initial_status(self):
         if not self.entries:
-            return "welcome — try: add mood <text> #tag"
+            return "welcome — try: jot <text> #tag"
         seed = self._daily_seed_entry()
         return f"{len(self.entries)} entries — today's pull: [{seed['id']}] {seed['category']}"
 

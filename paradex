@@ -42,9 +42,10 @@ HELP_TEXT = [
     "  spreads                            list saved spreads",
     "  build [name]                       save the last roll as a build sheet",
     "  export [category|#tag|@project]    dump matching entries to builds/",
-    "  newproj <name>                     start a tracked project",
+    "  newproj <name> [from roll]         start a project, optionally seeded with the last roll",
     "  projects [id]                      list projects, or show one in detail",
     "  pin <project-id> <id> [id ...]     pin entries to a project",
+    "  pin <project-id> roll              pin the last roll's entries to a project",
     "  unpin <project-id> <id> [id ...]   unpin entries from a project",
     "  status <project-id> <stage>        seed | active | shelved | done",
     "  note <project-id> <text>           set a project's notes",
@@ -65,7 +66,9 @@ HELP_TEXT = [
     "  spread concept mood palette texture mechanic",
     "  roll spread concept",
     "  newproj wraith-game",
+    "  newproj wraith-game from roll",
     "  pin 1 1 2 3",
+    "  pin 1 roll",
     "  status 1 active",
     "  roll 3 @wraith-game",
 ]
@@ -482,17 +485,26 @@ class App:
 
     def _cmd_newproj(self, rest):
         name = rest.strip()
+        from_roll = False
+        m = re.match(r"^(.*?)\s+from\s+roll$", name, re.IGNORECASE)
+        if m:
+            name, from_roll = m.group(1).strip(), True
         if not name:
-            return ["usage: newproj <name>"], "error: missing name"
+            return ["usage: newproj <name> [from roll]"], "error: missing name"
+        if from_roll and not self.last_roll:
+            return ["nothing rolled yet — try 'roll' first."], "error: nothing to build from"
         self._snapshot()
         pid = self.next_project_id
         self.next_project_id += 1
+        entry_ids = sorted({e["id"] for e in self.last_roll}) if from_roll else []
         proj = {
             "id": pid, "name": name, "status": "seed", "notes": "",
-            "entry_ids": [], "created": date.today().isoformat(),
+            "entry_ids": entry_ids, "created": date.today().isoformat(),
         }
         self.projects.append(proj)
         self._save()
+        if from_roll:
+            return self._project_detail(proj), f"created project [{pid}] {name} — pinned {len(entry_ids)} from last roll"
         return [f"[{pid}] {name}  (seed)"], f"created project [{pid}] {name}"
 
     def _cmd_projects(self, rest):
@@ -527,12 +539,24 @@ class App:
         parts = rest.split()
         verb = "pin" if add else "unpin"
         if len(parts) < 2:
-            return [f"usage: {verb} <project-id> <entry-id> [entry-id ...]"], "error: need a project id and at least one entry id"
-        try:
-            pid = int(parts[0])
-            eids = [int(p) for p in parts[1:]]
-        except ValueError:
-            return ["ids must be numbers"], "error: bad id"
+            usage = f"usage: {verb} <project-id> <entry-id> [entry-id ...]"
+            if add:
+                usage += f" | {verb} <project-id> roll"
+            return [usage], "error: need a project id and at least one entry id"
+        if add and len(parts) == 2 and parts[1].lower() == "roll":
+            if not self.last_roll:
+                return ["nothing rolled yet — try 'roll' first."], "error: nothing to pin"
+            eids = sorted({e["id"] for e in self.last_roll})
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                return ["ids must be numbers"], "error: bad id"
+        else:
+            try:
+                pid = int(parts[0])
+                eids = [int(p) for p in parts[1:]]
+            except ValueError:
+                return ["ids must be numbers"], "error: bad id"
         proj = next((p for p in self.projects if p["id"] == pid), None)
         if proj is None:
             return [f"no project [{pid}]"], f"error: no project [{pid}]"

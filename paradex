@@ -657,19 +657,11 @@ class App:
             lines.extend(textwrap.wrap(body, width=width, subsequent_indent="    ") or [""])
         return lines
 
-    def render_list_view(self, entries, width=34, max_lines=18):
+    def render_list_view(self, entries, width=34):
         if not entries:
             return ["(nothing here yet)", "try: add mood <text> #tag"]
         entries = sorted(entries, key=lambda e: -e["id"])
-        lines, shown = [], 0
-        for e in entries:
-            wrapped = self._entry_lines([e], width=width)
-            if len(lines) + len(wrapped) > max_lines - 1 and shown < len(entries):
-                lines.append(f"...and {len(entries) - shown} more (narrow with find/list)")
-                break
-            lines.extend(wrapped)
-            shown += 1
-        return lines
+        return self._entry_lines(entries, width=width)
 
     def _daily_seed_entry(self):
         if not self.entries:
@@ -682,7 +674,7 @@ class App:
             return ["welcome to paradex.", "", "file the aesthetics you keep", "coming back to. pull a random", "set later to seed a concept.", "", "try:", "  add mood <text> #tag", "  help"]
         seed = self._daily_seed_entry()
         header = ["◈ today's pull", ""] + self._entry_lines([seed]) + ["", "· " * 17, ""]
-        return header + self.render_list_view(list(self.entries), max_lines=max(4, 18 - len(header)))
+        return header + self.render_list_view(list(self.entries))
 
     def initial_status(self):
         if not self.entries:
@@ -772,6 +764,23 @@ def render_box_lines(view, status, buf, cursor, fw, fh, inner_w, content_h, titl
 CONTENT_H, INNER_W = 18, 34
 
 
+def paginate_view(view, offset, content_h):
+    """slice `view` down to exactly content_h lines starting at `offset`,
+    clamped in range. views longer than content_h lose their last line to
+    a scroll indicator so overflow is always visible/reachable instead of
+    silently cut off (this is how 'help' used to lose 26 of its 44 lines)."""
+    total = len(view)
+    if total <= content_h:
+        return list(view), 0
+    max_offset = total - (content_h - 1)
+    offset = max(0, min(offset, max_offset))
+    visible = view[offset:offset + content_h - 1]
+    up = "↑" if offset > 0 else " "
+    down = "↓" if offset + len(visible) < total else " "
+    indicator = f"{up} {offset + 1}-{offset + len(visible)}/{total} {down}  pgup/pgdn to scroll"
+    return visible + [indicator], offset
+
+
 def handle_key(app, buf, cursor, history, hist_idx, control):
     """apply one logical keypress. `control` is one of the KEY_* sentinels
     below, or a single printable character. returns (buf, cursor, hist_idx,
@@ -859,10 +868,12 @@ def _curses_main(stdscr):
     status = app.initial_status()
     buf, cursor = [], 0
     history, hist_idx = [], 0
+    scroll = 0
 
     while True:
+        page, scroll = paginate_view(view, scroll, content_h)
         lines, _title_row, input_row, input_col = render_box_lines(
-            view, status, buf, cursor, fw, fh, inner_w, content_h, "PARADEX")
+            page, status, buf, cursor, fw, fh, inner_w, content_h, "PARADEX")
         stdscr.clear()
         for i, line in enumerate(lines):
             attr = pair | (curses.A_BOLD if i == 1 else 0)
@@ -894,6 +905,12 @@ def _curses_main(stdscr):
             control = "DOWN"
         elif ch == curses.KEY_RESIZE:
             continue
+        elif ch in (curses.KEY_PPAGE, 21):  # PageUp, Ctrl+U
+            scroll = max(0, scroll - (content_h - 1))
+            continue
+        elif ch in (curses.KEY_NPAGE, 4):  # PageDown, Ctrl+D
+            scroll += content_h - 1
+            continue
         elif 32 <= ch < 127:
             control = chr(ch)
         else:
@@ -904,6 +921,7 @@ def _curses_main(stdscr):
             break
         if result is not None:
             view, status = result
+            scroll = 0
 
 
 # ---------------------------------------------------------------------------
@@ -917,6 +935,7 @@ _TK_KEYSYM_TO_CONTROL = {
     "Left": "LEFT", "Right": "RIGHT", "Home": "HOME", "End": "END",
     "Up": "UP", "Down": "DOWN",
 }
+_TK_SCROLL_KEYSYMS = {"Prior": -1, "Next": 1}  # PageUp / PageDown
 
 
 def cmd_window(args):
@@ -927,7 +946,7 @@ def cmd_window(args):
     state = {
         "view": app.render_initial(),
         "status": app.initial_status(),
-        "buf": [], "cursor": 0, "history": [], "hist_idx": 0,
+        "buf": [], "cursor": 0, "history": [], "hist_idx": 0, "scroll": 0,
     }
 
     inner_w, content_h = INNER_W, args.rows or CONTENT_H
@@ -959,8 +978,9 @@ def cmd_window(args):
     root.resizable(False, False)
 
     def render():
+        page, state["scroll"] = paginate_view(state["view"], state["scroll"], content_h)
         lines, title_row, input_row, input_col = render_box_lines(
-            state["view"], state["status"], state["buf"], state["cursor"],
+            page, state["status"], state["buf"], state["cursor"],
             fw, fh, inner_w, content_h, "PARADEX")
         text.config(state="normal")
         text.delete("1.0", "end")
@@ -981,6 +1001,10 @@ def cmd_window(args):
         if keysym == "Escape":
             root.destroy()
             return "break"
+        if keysym in _TK_SCROLL_KEYSYMS:
+            state["scroll"] += _TK_SCROLL_KEYSYMS[keysym] * (content_h - 1)
+            render()
+            return "break"
         control = _TK_KEYSYM_TO_CONTROL.get(keysym)
         if control is None:
             ch = event.char
@@ -995,6 +1019,7 @@ def cmd_window(args):
         state["buf"], state["cursor"], state["hist_idx"] = buf, cursor, hist_idx
         if result is not None:
             state["view"], state["status"] = result
+            state["scroll"] = 0
         render()
         return "break"
 
